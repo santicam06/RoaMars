@@ -62,10 +62,10 @@ export function RouteResults({ travelMode }: RouteResultsProps) {
                     type="button"
                     aria-pressed={active}
                     onClick={() => setHighlightedKind(route.kind)}
-                    className={`flex w-full flex-col gap-1 rounded-lg border border-l-4 px-3.5 py-2.5 text-left transition-colors duration-150 cursor-pointer ${
+                    className={`flex w-full flex-col gap-1 rounded-lg border border-l-4 px-3.5 py-2.5 text-left transition-all duration-150 cursor-pointer ${
                       active
                         ? 'border-[#F4C7C3] bg-[#FCE8E6]'
-                        : 'border-[#E0E0E0] hover:bg-[#F1F3F4]'
+                        : 'border-[#E0E0E0] opacity-60 hover:bg-[#F1F3F4] hover:opacity-100'
                     }`}
                     style={{ borderLeftColor: style.color }}
                   >

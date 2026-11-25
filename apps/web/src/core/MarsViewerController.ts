@@ -157,11 +157,20 @@ export class MarsViewerController {
     const vikingBasemap = createVikingBasemapProvider();
     this.baseImageryLayer = this.viewer.imageryLayers.addImageryProvider(vikingBasemap);
 
-    // Set initial Mars Trek framing
+    // Set initial Mars Trek framing (3D starts centered on Olympus Mons camps; 2D keeps default framing)
+    const initialLonDeg =
+      initialMode === '3d'
+        ? CAMERA_BOUNDS.initial3DLongitudeDeg
+        : CAMERA_BOUNDS.initialLongitudeDeg;
+    const initialLatDeg =
+      initialMode === '3d'
+        ? CAMERA_BOUNDS.initial3DLatitudeDeg
+        : CAMERA_BOUNDS.initialLatitudeDeg;
+
     this.viewer.camera.setView({
       destination: Cesium.Cartesian3.fromDegrees(
-        CAMERA_BOUNDS.initialLongitudeDeg,
-        CAMERA_BOUNDS.initialLatitudeDeg,
+        initialLonDeg,
+        initialLatDeg,
         CAMERA_BOUNDS.initialAltitudeMeters,
         MARS_ELLIPSOID
       ),

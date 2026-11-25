@@ -55,11 +55,14 @@ export class RouteOverlayManager {
     if (!request) return this.requestRender();
 
     // Draw the highlighted route last so it sits on top
+    const hasSelection = highlighted !== null && routes.some((r) => r.kind === highlighted);
     const ordered = [...routes].sort(
       (a, b) => Number(a.kind === highlighted) - Number(b.kind === highlighted)
     );
     for (const route of ordered) {
-      this.addRoute(route, route.kind === highlighted);
+      const isSelected = route.kind === highlighted;
+      const dimmed = hasSelection && !isSelected;
+      this.addRoute(route, isSelected, dimmed);
     }
     this.addPin(request.source, 'A', '#FFFFFF');
     this.addPin(request.destination, 'B', '#B91C1C');
@@ -72,9 +75,11 @@ export class RouteOverlayManager {
     this.requestRender();
   }
 
-  private addRoute(route: Route, highlighted: boolean) {
+  private addRoute(route: Route, highlighted: boolean, dimmed: boolean) {
     const style = ROUTE_STYLE[route.kind];
-    const color = Cesium.Color.fromCssColorString(style.color);
+    const baseColor = Cesium.Color.fromCssColorString(style.color);
+    const lineColor = dimmed ? baseColor.withAlpha(0.48) : baseColor;
+    const outlineColor = Cesium.Color.BLACK.withAlpha(dimmed ? 0.3 : 0.65);
     const positions = route.coordinates.map(([lon, lat]) =>
       Cesium.Cartesian3.fromDegrees(lon, lat, 0, MARS_ELLIPSOID)
     );
@@ -86,8 +91,8 @@ export class RouteOverlayManager {
         width: highlighted ? 6 : 4,
         clampToGround: true,
         material: new Cesium.PolylineOutlineMaterialProperty({
-          color,
-          outlineColor: Cesium.Color.BLACK.withAlpha(0.6),
+          color: lineColor,
+          outlineColor,
           outlineWidth: 1,
         }),
       },
@@ -97,17 +102,18 @@ export class RouteOverlayManager {
     // Label near the middle of the route, offset per kind so overlapping labels stay readable
     const [lon, lat] = route.coordinates[Math.floor(route.coordinates.length / 2)];
     const offsetY = { shortest: -18, fastest: 0, safest: 18 }[route.kind];
+    const labelOutline = baseColor.darken(0.4, new Cesium.Color());
     this.channel.entities.add({
       position: Cesium.Cartesian3.fromDegrees(lon, lat, 0, MARS_ELLIPSOID),
       label: {
         text: `${style.label} · ${formatKm(route.distance_m)} · ${formatDuration(route.eta_rover_s)}`,
         font: LABEL_FONT,
-        fillColor: Cesium.Color.WHITE,
-        outlineColor: color.darken(0.4, new Cesium.Color()),
+        fillColor: dimmed ? Cesium.Color.WHITE.withAlpha(0.6) : Cesium.Color.WHITE,
+        outlineColor: dimmed ? labelOutline.withAlpha(0.5) : labelOutline,
         outlineWidth: 3,
         style: Cesium.LabelStyle.FILL_AND_OUTLINE,
         showBackground: true,
-        backgroundColor: Cesium.Color.BLACK.withAlpha(0.55),
+        backgroundColor: Cesium.Color.BLACK.withAlpha(dimmed ? 0.35 : 0.65),
         horizontalOrigin: Cesium.HorizontalOrigin.LEFT,
         pixelOffset: new Cesium.Cartesian2(12, offsetY),
         disableDepthTestDistance: Number.POSITIVE_INFINITY,

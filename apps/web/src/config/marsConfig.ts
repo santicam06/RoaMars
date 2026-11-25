@@ -48,9 +48,12 @@ export const CAMERA_BOUNDS = {
   minZoomDistanceMeters: 2_500,
   /** 32,000 km maximum zoom distance — frames both the 3D globe and full 2D map cleanly inside black space */
   maxZoomDistanceMeters: 32_000_000,
-  /** Default initial camera framing (centered near Margaritifer Terra / Valles Marineris hemisphere, full globe view) */
+  /** Default initial 2D camera framing (centered near Margaritifer Terra / Valles Marineris hemisphere, full map view) */
   initialLongitudeDeg: -22.0,
   initialLatitudeDeg: -4.0,
+  /** Default initial 3D globe framing (centered over the Olympus Mons crew camps, full globe view) */
+  initial3DLongitudeDeg: -136.8,
+  initial3DLatitudeDeg: 20.4,
   initialAltitudeMeters: 11_500_000,
 } as const;
 
