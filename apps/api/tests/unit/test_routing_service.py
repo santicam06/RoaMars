@@ -202,3 +202,109 @@ def test_walkable_area_marks_cliffs_steep_and_plateau_unreachable(synthetic_dem)
     assert (grid[plateau_top & inside] == "4").all()  # flat top, cut off by cliffs
     assert cell_at(response, grid, WALL_WEST, -0.1) == "3"  # cliff edge
     assert (grid[(lon_grid < 0.0) & inside] == "1").all()  # source side: reachable via the gap
+
+
+def test_base_terrain_reuses_dem_read_across_slope_limits(synthetic_dem):
+    base_reader = synthetic_dem(mound)
+    reads = 0
+
+    class CountingReader:
+        def read_patch(self, lat, lon, radius_m, max_side_px=None):
+            nonlocal reads
+            reads += 1
+            return base_reader.read_patch(lat, lon, radius_m, max_side_px)
+
+    reader = CountingReader()
+    r15 = compute_routes(request(max_slope_deg=15.0), reader, SETTINGS)
+    r25 = compute_routes(request(max_slope_deg=25.0), reader, SETTINGS)
+    r15_again = compute_routes(request(max_slope_deg=15.0), reader, SETTINGS)
+
+    assert reads == 1  # 25° reuses cached patch + base geometry from 15°
+    assert r15_again == r15
+    assert r25.max_slope_deg == 25.0
+
+
+def test_connected_component_handles_diagonal_bridges():
+    from app.modules.routing.graph import connected_component_mask
+
+    # 8-connected diagonal chain from (0, 0) to (2, 2); (0, 4) is isolated by a 2-col gap
+    grid = np.array(
+        [
+            [True, False, False, False, True],
+            [False, True, False, False, False],
+            [False, False, True, False, True],
+        ],
+        dtype=bool,
+    )
+    mask = connected_component_mask(grid, 0, 0)
+    assert mask[0, 0] and mask[1, 1] and mask[2, 2]
+    assert not mask[0, 4] and not mask[2, 4]
+
+
+def test_astar_matches_dijkstra_costs_on_mound(synthetic_dem):
+    from app.modules.routing.graph import (
+        SpeedModel,
+        astar_path,
+        build_distance_heuristic,
+        build_terrain,
+        node_id,
+    )
+    from app.modules.routing.service import _nearest_pixel
+
+    req = request()
+    reader = synthetic_dem(mound)
+    center_lat = (req.source.lat + req.destination.lat) / 2
+    center_lon = (req.source.lon + req.destination.lon) / 2
+    radius = SETTINGS.route_graph_radius_m
+    patch = reader.read_patch(center_lat, center_lon, radius, SETTINGS.route_graph_max_side_px)
+    speed = SpeedModel(
+        SETTINGS.rover_speed_kmh, SETTINGS.eva_speed_kmh, SETTINGS.route_max_slope_deg
+    )
+    terrain = build_terrain(patch, center_lat, center_lon, radius, speed)
+
+    cols = patch.elevation.shape[1]
+    sr, sc = _nearest_pixel(patch, req.source)
+    gr, gc = _nearest_pixel(patch, req.destination)
+    start, goal = node_id(sr, sc, cols), node_id(gr, gc, cols)
+    n = terrain.rows * terrain.cols
+
+    h_dist = build_distance_heuristic(patch, terrain, gr, gc)
+    zeros = [0.0] * n
+    checks = [
+        ("distance", h_dist.ravel().tolist()),
+        ("time", (h_dist / (speed.rover_kmh / 3.6)).ravel().tolist()),
+        ("safety", h_dist.ravel().tolist()),
+    ]
+
+    def path_cost(path: list[int], weight_kind: str) -> float:
+        w_e, w_s, w_se, w_sw = terrain.weights[weight_kind]
+        total = 0.0
+        for u, v in zip(path, path[1:], strict=False):
+            ur, uc = divmod(u, cols)
+            vr, vc = divmod(v, cols)
+            dr, dc = vr - ur, vc - uc
+            if (dr, dc) == (0, 1):
+                total += float(w_e[ur, uc])
+            elif (dr, dc) == (0, -1):
+                total += float(w_e[vr, vc])
+            elif (dr, dc) == (1, 0):
+                total += float(w_s[ur, uc])
+            elif (dr, dc) == (-1, 0):
+                total += float(w_s[vr, vc])
+            elif (dr, dc) == (1, 1):
+                total += float(w_se[ur, uc])
+            elif (dr, dc) == (-1, -1):
+                total += float(w_se[vr, vc])
+            elif (dr, dc) == (1, -1):
+                total += float(w_sw[ur, uc])
+            else:
+                total += float(w_sw[vr, vc])
+        return total
+
+    for weight_kind, heuristic in checks:
+        p_astar = astar_path(terrain, start, goal, weight_kind, heuristic)
+        p_dijk = astar_path(terrain, start, goal, weight_kind, zeros)
+        assert p_astar is not None and p_dijk is not None
+        assert path_cost(p_astar, weight_kind) == pytest.approx(
+            path_cost(p_dijk, weight_kind), rel=1e-9
+        )

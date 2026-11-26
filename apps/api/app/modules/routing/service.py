@@ -1,13 +1,26 @@
 """Computes the shortest, fastest and safest traversable routes between two points."""
 
-import networkx as nx
+import threading
+from collections import OrderedDict
+from weakref import WeakKeyDictionary
+
 import numpy as np
 
 from app.core.config import Settings
 from app.modules.routing.dem import DemPatch, DemReader
 from app.modules.routing.errors import NoSafeRouteError, OutsideDemError, SourceTooFarError
 from app.modules.routing.geo import haversine_m
-from app.modules.routing.graph import SpeedModel, Terrain, build_terrain, node_id
+from app.modules.routing.graph import (
+    BaseTerrain,
+    SpeedModel,
+    Terrain,
+    astar_path,
+    build_base_terrain,
+    build_distance_heuristic,
+    build_terrain_from_base,
+    connected_component_mask,
+    node_id,
+)
 from app.modules.routing.schemas import (
     CELL_GENTLE,
     CELL_MODERATE,
@@ -31,6 +44,73 @@ ROUTE_WEIGHTS: dict[RouteKind, str] = {
     "safest": "safety",
 }
 
+_CELL_CODE_OUTSIDE = ord(CELL_OUTSIDE)
+_CELL_CODE_GENTLE = ord(CELL_GENTLE)
+_CELL_CODE_MODERATE = ord(CELL_MODERATE)
+_CELL_CODE_STEEP = ord(CELL_STEEP)
+_CELL_CODE_UNREACHABLE = ord(CELL_UNREACHABLE)
+
+_BASE_TERRAIN_CACHE_MAX = 8
+_ROUTE_CACHE_MAX = 64
+
+type _BaseKey = tuple[float, float, float, int]
+type _RouteKey = tuple[float, float, float, float, float, float, float, int, float, float, float]
+type _CachedOutcome = tuple[RouteResponse, None] | tuple[None, tuple[str, WalkableArea | None]]
+
+
+class _ReaderCache:
+    """Thread-safe per-DEM-reader LRU caches for base terrain patches and route responses."""
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._base: OrderedDict[_BaseKey, tuple[DemPatch, BaseTerrain]] = OrderedDict()
+        self._routes: OrderedDict[_RouteKey, _CachedOutcome] = OrderedDict()
+
+    def get_base(self, key: _BaseKey) -> tuple[DemPatch, BaseTerrain] | None:
+        with self._lock:
+            entry = self._base.get(key)
+            if entry is not None:
+                self._base.move_to_end(key)
+            return entry
+
+    def put_base(self, key: _BaseKey, value: tuple[DemPatch, BaseTerrain]) -> None:
+        with self._lock:
+            self._base[key] = value
+            self._base.move_to_end(key)
+            while len(self._base) > _BASE_TERRAIN_CACHE_MAX:
+                self._base.popitem(last=False)
+
+    def get_route(self, key: _RouteKey) -> _CachedOutcome | None:
+        with self._lock:
+            entry = self._routes.get(key)
+            if entry is not None:
+                self._routes.move_to_end(key)
+            return entry
+
+    def put_route(self, key: _RouteKey, value: _CachedOutcome) -> None:
+        with self._lock:
+            self._routes[key] = value
+            self._routes.move_to_end(key)
+            while len(self._routes) > _ROUTE_CACHE_MAX:
+                self._routes.popitem(last=False)
+
+
+_CACHE_REGISTRY_LOCK = threading.Lock()
+_READER_CACHES: WeakKeyDictionary[DemReader, _ReaderCache] = WeakKeyDictionary()
+
+
+def _reader_cache(reader: DemReader) -> _ReaderCache | None:
+    with _CACHE_REGISTRY_LOCK:
+        try:
+            cache = _READER_CACHES.get(reader)
+            if cache is None:
+                cache = _ReaderCache()
+                _READER_CACHES[reader] = cache
+            return cache
+        except TypeError:
+            # Reader implementation does not support weak references
+            return None
+
 
 def compute_routes(request: RouteRequest, reader: DemReader, settings: Settings) -> RouteResponse:
     source, destination = request.source, request.destination
@@ -43,6 +123,29 @@ def compute_routes(request: RouteRequest, reader: DemReader, settings: Settings)
             f"{settings.route_source_max_distance_m / 1000:.0f} km."
         )
 
+    cache = _reader_cache(reader)
+    route_key: _RouteKey = (
+        source.lat,
+        source.lon,
+        destination.lat,
+        destination.lon,
+        max_slope,
+        settings.route_source_max_distance_m,
+        settings.route_graph_radius_m,
+        settings.route_graph_max_side_px,
+        settings.route_area_margin_fraction,
+        settings.rover_speed_kmh,
+        settings.eva_speed_kmh,
+    )
+    if cache is not None:
+        cached = cache.get_route(route_key)
+        if cached is not None:
+            response, err = cached
+            if response is not None:
+                return response
+            assert err is not None
+            raise NoSafeRouteError(err[0], err[1])
+
     # Plan over a disc centred between the endpoints, padded so detours around obstacles fit.
     # Antimeridian crossings are rejected by the reader, so a plain lat/lon mean is enough.
     center_lat = (source.lat + destination.lat) / 2
@@ -51,70 +154,98 @@ def compute_routes(request: RouteRequest, reader: DemReader, settings: Settings)
         settings.route_graph_radius_m,
         separation / 2 * (1 + settings.route_area_margin_fraction),
     )
-    patch = reader.read_patch(center_lat, center_lon, radius, settings.route_graph_max_side_px)
+
+    base_key: _BaseKey = (center_lat, center_lon, radius, settings.route_graph_max_side_px)
+    base_entry = cache.get_base(base_key) if cache is not None else None
+    if base_entry is not None:
+        patch, base = base_entry
+    else:
+        patch = reader.read_patch(center_lat, center_lon, radius, settings.route_graph_max_side_px)
+        base = build_base_terrain(patch, center_lat, center_lon, radius)
+        if cache is not None:
+            cache.put_base(base_key, (patch, base))
+
     speed = SpeedModel(settings.rover_speed_kmh, settings.eva_speed_kmh, max_slope)
-    terrain = build_terrain(patch, center_lat, center_lon, radius, speed)
+    terrain = build_terrain_from_base(base, speed)
 
     cols = patch.elevation.shape[1]
     source_px = _nearest_pixel(patch, source)
     goal_px = _nearest_pixel(patch, destination)
     start, goal = node_id(*source_px, cols), node_id(*goal_px, cols)
-    # Computed up front so a "no safe route" error can still show the terrain that blocks it
-    walkable_area = _walkable_area(patch, terrain, goal)
+
+    # Computed up front so a "no safe route" error can still show the terrain that blocks it,
+    # and so disconnected source/goal pairs fail immediately without searching.
+    reachable = connected_component_mask(terrain.traversable, goal_px[0], goal_px[1])
+    walkable_area = _walkable_area(patch, terrain, reachable)
 
     for name, (row, col) in (("source", source_px), ("destination", goal_px)):
         if not terrain.traversable[row, col]:
-            raise NoSafeRouteError(
+            detail = (
                 f"The {name} sits on terrain steeper than the {max_slope:g}° slope limit "
-                f"({terrain.pixel_slope_deg[row, col]:.1f}°).",
-                walkable_area,
+                f"({terrain.pixel_slope_deg[row, col]:.1f}°)."
             )
+            if cache is not None:
+                cache.put_route(route_key, (None, (detail, walkable_area)))
+            raise NoSafeRouteError(detail, walkable_area)
+
+    if not reachable[source_px]:
+        detail = f"No route between the points stays under the {max_slope:g}° slope limit."
+        if cache is not None:
+            cache.put_route(route_key, (None, (detail, walkable_area)))
+        raise NoSafeRouteError(detail, walkable_area)
+
+    h_dist_arr = build_distance_heuristic(patch, terrain, goal_px[0], goal_px[1])
+    h_dist = h_dist_arr.ravel().tolist()
+    h_time = (h_dist_arr / (speed.rover_kmh / 3.6)).ravel().tolist()
+    heuristics: dict[RouteKind, list[float]] = {
+        "shortest": h_dist,
+        "fastest": h_time,
+        "safest": h_dist,
+    }
 
     paths: dict[RouteKind, list[int]] = {}
     for kind, weight in ROUTE_WEIGHTS.items():
-        try:
-            paths[kind] = nx.dijkstra_path(terrain.graph, start, goal, weight=weight)
-        except (nx.NetworkXNoPath, nx.NodeNotFound) as exc:
-            raise NoSafeRouteError(
-                f"No route between the points stays under the {max_slope:g}° slope limit.",
-                walkable_area,
-            ) from exc
+        path = astar_path(terrain, start, goal, weight, heuristics[kind])
+        if path is None:
+            detail = f"No route between the points stays under the {max_slope:g}° slope limit."
+            if cache is not None:
+                cache.put_route(route_key, (None, (detail, walkable_area)))
+            raise NoSafeRouteError(detail, walkable_area)
+        paths[kind] = path
 
     routes = [
         _describe(kind, path, patch, source, destination, speed) for kind, path in paths.items()
     ]
-    return RouteResponse(
+    response = RouteResponse(
         routes=routes,
         dem_resolution_m=patch.resolution_m,
         max_slope_deg=max_slope,
         warnings=_resolution_warnings(patch) + _duplicate_warnings(paths),
         walkable_area=walkable_area,
     )
+    if cache is not None:
+        cache.put_route(route_key, (response, None))
+    return response
 
 
-def _walkable_area(patch: DemPatch, terrain: Terrain, goal: int) -> WalkableArea:
+def _walkable_area(patch: DemPatch, terrain: Terrain, reachable: np.ndarray) -> WalkableArea:
     """Classifies each planning-area pixel by its own slope and by reachability.
 
-    The graph is undirected, so the destination's connected component is exactly the set of
-    pixels with a slope-safe path to (and from) the destination. Traversable pixels outside
-    it are walled-off pockets.
+    The terrain grid is undirected, so the destination's connected component is exactly the set of
+    pixels with a slope-safe path to (and from) the destination. Traversable pixels outside it are
+    walled-off pockets.
     """
     rows, cols = patch.elevation.shape
     gentle_max = terrain.max_slope_deg * GENTLE_SLOPE_FRACTION
     slope = terrain.pixel_slope_deg
 
-    cells = np.full((rows, cols), CELL_OUTSIDE, dtype="<U1")
+    cells = np.full((rows, cols), _CELL_CODE_OUTSIDE, dtype=np.uint8)
     with np.errstate(invalid="ignore"):
-        cells[terrain.in_area & (slope > terrain.max_slope_deg)] = CELL_STEEP
-    cells[terrain.traversable] = CELL_UNREACHABLE
-
-    reachable = np.zeros(rows * cols, dtype=bool)
-    if goal in terrain.graph:
-        reachable[list(nx.node_connected_component(terrain.graph, goal))] = True
-    reachable = reachable.reshape(rows, cols)
+        cells[terrain.in_area & (slope > terrain.max_slope_deg)] = _CELL_CODE_STEEP
+    cells[terrain.traversable] = _CELL_CODE_UNREACHABLE
     with np.errstate(invalid="ignore"):
-        cells[reachable & (slope <= gentle_max)] = CELL_GENTLE
-        cells[reachable & (slope > gentle_max)] = CELL_MODERATE
+        cells[reachable & (slope <= gentle_max)] = _CELL_CODE_GENTLE
+        cells[reachable & (slope > gentle_max)] = _CELL_CODE_MODERATE
 
     half_lat = abs(patch.lats[0] - patch.lats[1]) / 2 if rows > 1 else 0.0
     half_lon = abs(patch.lons[1] - patch.lons[0]) / 2 if cols > 1 else 0.0
@@ -127,7 +258,7 @@ def _walkable_area(patch: DemPatch, terrain: Terrain, goal: int) -> WalkableArea
         cols=cols,
         gentle_max_slope_deg=round(gentle_max, 2),
         max_slope_deg=terrain.max_slope_deg,
-        cells="".join(cells.ravel()),
+        cells=cells.tobytes().decode("ascii"),
     )
 
 
