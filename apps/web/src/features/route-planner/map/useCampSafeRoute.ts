@@ -35,12 +35,21 @@ export function useCampSafeRoute(): void {
     }
     useOutpostSelection.getState().setOpen(false);
     useNomenclatureSelection.getState().setHit(null);
-    void routing.setRequest({
-      source: toLatLon(source),
-      destination: toLatLon(destination),
-      max_slope_deg: MAX_SLOPE_DEG[travelMode],
-    });
-  }, [source, destination, travelMode]);
+    const activeMode = useRoutePlannerStore.getState().travelMode === 'rover' ? 'rover' : 'eva';
+    const src = toLatLon(source);
+    const dst = toLatLon(destination);
+    void routing.setModeRequests(
+      {
+        eva: { source: src, destination: dst, max_slope_deg: MAX_SLOPE_DEG.marswalk },
+        rover: { source: src, destination: dst, max_slope_deg: MAX_SLOPE_DEG.rover },
+      },
+      activeMode
+    );
+  }, [source, destination]);
+
+  useEffect(() => {
+    useRoutingStore.getState().setEtaMode(travelMode === 'rover' ? 'rover' : 'eva');
+  }, [travelMode]);
 
   // Leave no route behind when the planner unmounts
   useEffect(() => () => useRoutingStore.getState().clear(), []);

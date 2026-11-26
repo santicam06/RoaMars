@@ -1,6 +1,7 @@
 /** Mirrors `apps/api/app/modules/routing/schemas.py`. */
 
 export type RouteKind = 'shortest' | 'fastest' | 'safest';
+export type RouteEtaMode = 'eva' | 'rover';
 
 export interface LatLon {
   lat: number;
