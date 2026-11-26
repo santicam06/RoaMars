@@ -1,11 +1,12 @@
-import { ArrowUpDown, MapPin, X } from 'lucide-react';
+import { useRef, useState, type PointerEvent } from 'react';
+import { ArrowUpDown, GripHorizontal, MapPin, X } from 'lucide-react';
 import { LocationDetailsPanel } from '../../../components/Locations/LocationDetailsPanel';
 import { OlympusRehearsal } from '../../../components/Outposts/OlympusRehearsal';
 import type { MarsViewerController } from '../../../core/MarsViewerController';
 import { useNomenclatureSelection } from '../../../components/Locations/useNomenclatureSelection';
 import { DEFAULT_ROUTE_KIND } from '../../routing/config/routeStyle';
 import { formatDuration, formatKm } from '../../routing/map/RouteOverlayManager';
-import { useRoutingStore } from '../../routing/store/useRoutingStore';
+import { shortestEtaSeconds, useRoutingStore } from '../../routing/store/useRoutingStore';
 import { useCampSafeRoute } from '../map/useCampSafeRoute';
 import { useRoutePlannerStore } from '../store/useRoutePlannerStore';
 import type { TravelMode } from '../types';
@@ -14,11 +15,18 @@ import { LocationInputBox } from './LocationInputBox';
 import { RouteDetails } from './RouteDetails';
 import { RouteResults } from './RouteResults';
 
+const MIN_TOP_SECTION_PX = 140;
+const MIN_BOTTOM_SECTION_PX = 140;
+
 interface RouteLateralBarProps {
   controller: MarsViewerController | null;
 }
 
 export function RouteLateralBar({ controller }: RouteLateralBarProps) {
+  const asideRef = useRef<HTMLElement | null>(null);
+  const topSectionRef = useRef<HTMLDivElement | null>(null);
+  const dragStateRef = useRef<{ startY: number; startHeight: number } | null>(null);
+  const [topHeightPx, setTopHeightPx] = useState<number | null>(null);
   const isOpen = useRoutePlannerStore((s) => s.isOpen);
   const isRouteCalculatorOpen = useRoutePlannerStore((s) => s.isRouteCalculatorOpen);
   const travelMode = useRoutePlannerStore((s) => s.travelMode);
@@ -32,8 +40,14 @@ export function RouteLateralBar({ controller }: RouteLateralBarProps) {
   const selectedRoute = useRoutingStore(
     (s) => s.routes.find((r) => r.kind === (s.highlightedKind ?? DEFAULT_ROUTE_KIND)) ?? null
   );
-  const marswalkEta = selectedRoute ? formatDuration(selectedRoute.eta_eva_s) : null;
-  const roverEta = selectedRoute ? formatDuration(selectedRoute.eta_rover_s) : null;
+  const marswalkEtaSeconds = useRoutingStore((s) =>
+    shortestEtaSeconds(s.modeResults.eva?.routes ?? [], 'eva')
+  );
+  const roverEtaSeconds = useRoutingStore((s) =>
+    shortestEtaSeconds(s.modeResults.rover?.routes ?? [], 'rover')
+  );
+  const marswalkEta = marswalkEtaSeconds !== null ? formatDuration(marswalkEtaSeconds) : null;
+  const roverEta = roverEtaSeconds !== null ? formatDuration(roverEtaSeconds) : null;
 
   const setOpen = useRoutePlannerStore((s) => s.setOpen);
   const setTravelMode = useRoutePlannerStore((s) => s.setTravelMode);
@@ -71,19 +85,58 @@ export function RouteLateralBar({ controller }: RouteLateralBarProps) {
 
   const formattedDistance = selectedRoute ? formatKm(selectedRoute.distance_m) : '-- km';
 
+  const handleSeparatorPointerDown = (e: PointerEvent<HTMLDivElement>) => {
+    const topEl = topSectionRef.current;
+    if (!topEl) return;
+    e.currentTarget.setPointerCapture(e.pointerId);
+    dragStateRef.current = {
+      startY: e.clientY,
+      startHeight: topEl.getBoundingClientRect().height,
+    };
+  };
+
+  const handleSeparatorPointerMove = (e: PointerEvent<HTMLDivElement>) => {
+    const drag = dragStateRef.current;
+    const asideEl = asideRef.current;
+    if (!drag || !asideEl) return;
+    const maxTop = Math.max(
+      MIN_TOP_SECTION_PX,
+      asideEl.getBoundingClientRect().height - 56 - MIN_BOTTOM_SECTION_PX
+    );
+    const next = Math.min(maxTop, Math.max(MIN_TOP_SECTION_PX, drag.startHeight + (e.clientY - drag.startY)));
+    setTopHeightPx(next);
+  };
+
+  const handleSeparatorPointerUp = (e: PointerEvent<HTMLDivElement>) => {
+    if (dragStateRef.current) {
+      dragStateRef.current = null;
+      if (e.currentTarget.hasPointerCapture(e.pointerId)) {
+        e.currentTarget.releasePointerCapture(e.pointerId);
+      }
+    }
+  };
+
   return (
     <aside
+      ref={asideRef}
       aria-label="Martian traversal route planner"
       aria-hidden={!isOpen}
-      className={`pointer-events-auto fixed top-0 left-0 z-20 flex h-full w-[475px] max-w-[calc(100vw-3rem)] flex-col bg-white text-[#202124] shadow-[2px_0_12px_rgba(0,0,0,0.25)] transition-transform duration-250 ease-out ${
-        isOpen ? 'translate-x-0' : '-translate-x-full pointer-events-none'
+      className={`pointer-events-auto fixed top-0 left-0 z-20 flex h-full w-[475px] max-w-[calc(100vw-3rem)] flex-col bg-white text-[#202124] transition-[transform,opacity] duration-250 ease-out ${
+        isOpen
+          ? 'translate-x-0 opacity-100 shadow-[2px_0_12px_rgba(0,0,0,0.25)]'
+          : '-translate-x-full opacity-0 pointer-events-none'
       }`}
     >
       {/* Room for the map search bar, which sits on top of this bar (Google Maps style) */}
       <div className="h-14 shrink-0" aria-hidden="true" />
       {isRouteCalculatorOpen ? (
         <>
-          {/* Top section: Travel modes (Marswalk & Rover) + ETA below each icon + Close button */}
+          <div
+            ref={topSectionRef}
+            style={topHeightPx !== null ? { height: `${topHeightPx}px` } : undefined}
+            className="shrink-0 overflow-y-auto"
+          >
+            {/* Top section: Travel modes (Marswalk & Rover) + ETA below each icon + Close button */}
           <div className="px-4 pt-3.5 pb-4">
             <div className="relative flex items-start justify-center">
               <div
@@ -196,9 +249,25 @@ export function RouteLateralBar({ controller }: RouteLateralBarProps) {
             </div>
           </div>
 
-          <RouteResults travelMode={travelMode} />
+            <RouteResults travelMode={travelMode} />
+          </div>
 
-          <div className="h-[6px] w-full shrink-0 border-y border-red-700/20 bg-red-50" />
+          <div
+            role="separator"
+            aria-orientation="horizontal"
+            aria-label="Resize route planner and details sections"
+            title="Drag up or down to resize"
+            onPointerDown={handleSeparatorPointerDown}
+            onPointerMove={handleSeparatorPointerMove}
+            onPointerUp={handleSeparatorPointerUp}
+            onPointerCancel={handleSeparatorPointerUp}
+            className="group flex h-3.5 w-full shrink-0 cursor-ns-resize touch-none select-none items-center justify-center border-y border-red-700/20 bg-red-50 transition-colors hover:bg-red-100"
+          >
+            <GripHorizontal
+              className="h-3.5 w-3.5 text-[#A50E0E]/60 transition-colors group-hover:text-[#A50E0E]"
+              aria-hidden="true"
+            />
+          </div>
         </>
       ) : (
         <div className="flex items-center justify-end border-b border-red-700/20 px-3 py-2">
