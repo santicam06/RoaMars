@@ -24,6 +24,15 @@ export function WelcomeDialog() {
       aria-labelledby="welcome-title"
       aria-describedby="welcome-description"
     >
+      <div
+        aria-hidden="true"
+        className="pointer-events-none absolute top-0 right-0 h-64 w-64 bg-[radial-gradient(circle_at_top_right,rgba(0,0,0,1)_0%,rgba(0,0,0,0.92)_48%,transparent_78%)]"
+      />
+      <img
+        src="/RoaMars-Logo.png"
+        alt="RoaMars logo"
+        className="welcome-fade-up pointer-events-none absolute top-3 right-3 h-28 w-28 rounded-full bg-black object-contain drop-shadow-lg select-none sm:h-36 sm:w-36"
+      />
       <div>
         <p className="font-orbitron welcome-fade-up text-[13px] font-bold tracking-[0.4em] text-red-300 uppercase">
           Welcome to
